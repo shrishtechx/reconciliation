@@ -108,7 +108,7 @@ export default function UploadScreen({ onUploaded, onValidationError, validateFi
           <Upload size={28} className="text-navy-600" />
         </div>
         <h2 className="text-xl font-bold text-navy-800 mb-1">Upload Ledger Files</h2>
-        <p className="text-gray-500 text-sm">Drop or select company ledger files (Excel, CSV, PDF supported)</p>
+        <p className="text-gray-500 text-sm">Drop or select company ledger files (Excel, CSV, PDF, JPG, PNG supported)</p>
         <p className="text-gray-400 text-xs mt-1">You can upload multiple ledgers per company using the + button</p>
       </div>
 
@@ -286,7 +286,7 @@ function FileDropZone({ label, sublabel, files, inputRef, onFile, accent, disabl
         <input
           ref={inputRef}
           type="file"
-          accept=".xls,.xlsx,.csv,.pdf"
+          accept=".xls,.xlsx,.csv,.pdf,.jpg,.jpeg,.png,.bmp,.tiff,.tif,.webp"
           className="hidden"
           multiple
           onChange={(e) => {
@@ -316,7 +316,7 @@ function FileDropZone({ label, sublabel, files, inputRef, onFile, accent, disabl
       <input
         ref={inputRef}
         type="file"
-        accept=".xls,.xlsx,.csv,.pdf"
+        accept=".xls,.xlsx,.csv,.pdf,.jpg,.jpeg,.png,.bmp,.tiff,.tif,.webp"
         className="hidden"
         multiple
         onChange={(e) => {
@@ -330,7 +330,7 @@ function FileDropZone({ label, sublabel, files, inputRef, onFile, accent, disabl
       <p className="font-semibold text-gray-700">{label}</p>
       <p className="text-xs text-gray-400 mt-1">{sublabel}</p>
       <p className="text-xs text-gray-400 mt-3">Drop files here or click to browse</p>
-      <p className="text-xs text-gray-300 mt-1">.xlsx, .xls, .csv, .pdf (multiple files supported)</p>
+      <p className="text-xs text-gray-300 mt-1">.xlsx, .xls, .csv, .pdf, .jpg, .jpeg, .png (multiple files supported)</p>
     </div>
   );
 }

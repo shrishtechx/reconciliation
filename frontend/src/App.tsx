@@ -31,12 +31,12 @@ function ToastContainer({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id
 }
 
 // ── Allowed file extensions ──────────────────────────────────
-const VALID_EXT = ['.xls', '.xlsx', '.csv', '.pdf', '.txt'];
+const VALID_EXT = ['.xls', '.xlsx', '.csv', '.pdf', '.txt', '.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'];
 const MIN_FILE_SIZE = 50; // bytes — empty file threshold
 
 function validateFile(file: File): string | null {
   const ext = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
-  if (!VALID_EXT.includes(ext)) return `"${file.name}" is not a valid format. Use .xls, .xlsx, .csv, .pdf, or .txt`;
+  if (!VALID_EXT.includes(ext)) return `"${file.name}" is not a valid format. Use .xls, .xlsx, .csv, .pdf, .jpg, .png, etc.`;
   if (file.size < MIN_FILE_SIZE) return `"${file.name}" appears to be empty (${file.size} bytes)`;
   if (file.size > 50 * 1024 * 1024) return `"${file.name}" is too large (max 50 MB)`;
   return null;

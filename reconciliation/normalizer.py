@@ -1,9 +1,9 @@
 """
 Data Normalization Module.
 Handles ingestion, cleaning, and standardization of financial datasets.
-Supports multiple formats: Excel (.xls/.xlsx), CSV, PDF, and SAP reports.
+Supports multiple formats: Excel (.xls/.xlsx), CSV, PDF, Images (JPG/JPEG/PNG), and SAP reports.
 Intelligently detects and normalizes various column structures (Debit/Credit, +/-, Dr/Cr).
-Uses OpenAI Vision API for accurate PDF extraction.
+Uses OpenAI GPT-4o-mini Vision API for accurate PDF and Image extraction.
 """
 
 import pandas as pd
@@ -21,35 +21,32 @@ from .config import ReconciliationConfig
 
 logger = logging.getLogger(__name__)
 
-# Optional PDF support
-try:
-    import pdfplumber
-    HAS_PDFPLUMBER = True
-except ImportError:
-    HAS_PDFPLUMBER = False
-
-try:
-    import tabula
-    HAS_TABULA = True
-except ImportError:
-    HAS_TABULA = False
-
-# OpenAI support for PDF extraction
+# OpenAI support for PDF/Image extraction
 try:
     from openai import OpenAI
     HAS_OPENAI = True
 except ImportError:
     HAS_OPENAI = False
 
-# PDF to image conversion
+# PyMuPDF for PDF to image conversion (no Poppler needed)
 try:
-    from pdf2image import convert_from_path, convert_from_bytes
-    HAS_PDF2IMAGE = True
+    import fitz  # PyMuPDF
+    HAS_PYMUPDF = True
 except ImportError:
-    HAS_PDF2IMAGE = False
+    HAS_PYMUPDF = False
+
+# PIL for image handling
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 # OpenAI API Key - can be overridden via environment variable
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "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")
+
+# Image file extensions
+IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp')
 
 
 class DataNormalizer:
@@ -123,79 +120,19 @@ class DataNormalizer:
             return 'csv'
         elif path.endswith('.txt'):
             return 'txt'
+        elif path.endswith(IMAGE_EXTENSIONS):
+            return 'image'
         return 'auto'
 
-    def _extract_pdf_with_openai(self, file_path_or_buffer) -> pd.DataFrame:
-        """Extract tables from PDF using OpenAI Vision API for 100% accuracy."""
-        if not HAS_OPENAI:
-            raise ValueError("OpenAI package not installed. Run: pip install openai")
-        
-        if not OPENAI_API_KEY:
-            raise ValueError("OpenAI API key not configured")
-        
-        # Read PDF bytes
-        if hasattr(file_path_or_buffer, 'read'):
-            file_path_or_buffer.seek(0)
-            pdf_bytes = file_path_or_buffer.read()
-        else:
-            with open(file_path_or_buffer, 'rb') as f:
-                pdf_bytes = f.read()
-        
-        # Convert PDF to images
-        images = []
-        if HAS_PDF2IMAGE:
-            try:
-                images = convert_from_bytes(pdf_bytes, dpi=200)
-                logger.info(f"Converted PDF to {len(images)} images using pdf2image")
-            except Exception as e:
-                logger.warning(f"pdf2image failed: {e}, trying alternative method")
-        
-        # If pdf2image failed, try using PyMuPDF or save and use path
-        if not images:
-            try:
-                import fitz  # PyMuPDF
-                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-                for page in doc:
-                    pix = page.get_pixmap(dpi=200)
-                    img_bytes = pix.tobytes("png")
-                    from PIL import Image
-                    img = Image.open(io.BytesIO(img_bytes))
-                    images.append(img)
-                doc.close()
-                logger.info(f"Converted PDF to {len(images)} images using PyMuPDF")
-            except ImportError:
-                # Save to temp file and try pdf2image with path
-                with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-                    tmp.write(pdf_bytes)
-                    tmp_path = tmp.name
-                try:
-                    if HAS_PDF2IMAGE:
-                        images = convert_from_path(tmp_path, dpi=200)
-                        logger.info(f"Converted PDF to {len(images)} images from path")
-                finally:
-                    os.unlink(tmp_path)
-        
-        if not images:
-            raise ValueError("Could not convert PDF to images. Install pdf2image and poppler.")
-        
-        # Initialize OpenAI client
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        
-        all_data = []
-        
-        for page_num, img in enumerate(images):
-            # Convert image to base64
-            img_buffer = io.BytesIO()
-            img.save(img_buffer, format='PNG')
-            img_buffer.seek(0)
-            base64_image = base64.b64encode(img_buffer.read()).decode('utf-8')
-            
-            # Call OpenAI Vision API
-            prompt = """Analyze this financial ledger/statement image and extract ALL transaction data into a structured JSON format.
+    # ── OpenAI GPT-4o-mini Vision extraction (PDF + Images) ──
 
-IMPORTANT: Extract EVERY single row of data with 100% accuracy. Do not miss any transactions.
+    _EXTRACTION_PROMPT = """You are a financial data extraction expert. Analyze this image of a financial ledger, statement, or report and extract ALL data into a structured JSON format.
 
-Return a JSON object with this structure:
+CRITICAL: Extract EVERY single row with 100% accuracy. Do NOT miss any transaction.
+
+The document may be structured or unstructured, in any format (Tally, SAP, bank statement, handwritten, scanned, etc.).
+
+Return a JSON object with this EXACT structure:
 {
     "headers": ["column1", "column2", ...],
     "rows": [
@@ -205,140 +142,197 @@ Return a JSON object with this structure:
 }
 
 Rules:
-1. Include ALL columns visible in the table (Date, Particulars, Voucher Type, Voucher No, Debit, Credit, etc.)
-2. Extract EVERY transaction row - do not skip any
-3. Preserve exact values including numbers, dates, and text
-4. For amounts, keep the original format (with or without commas)
-5. If a cell is empty, use empty string ""
-6. Skip header rows, summary rows, and totals - only include transaction data
-7. If there are multiple tables, combine all transaction rows
+1. Identify ALL columns visible in the table/document (Date, Particulars, Voucher Type, Voucher No, Debit, Credit, Balance, etc.)
+2. Extract EVERY data row - do not skip any transaction
+3. Preserve exact values: numbers (with or without commas), dates, text exactly as shown
+4. If a cell is empty, use empty string ""
+5. Do NOT include summary/total rows or opening/closing balance rows in the data rows
+6. If data spans multiple sections or tables, combine all transaction rows using a unified column set
+7. For amounts, keep the original number format - do not modify values
+8. If the document has no clear table structure, still extract all financial data into logical columns
 
-Return ONLY the JSON object, no other text."""
+Return ONLY the JSON object, no other text or explanation."""
+
+    def _call_openai_vision(self, base64_images: list, page_labels: list = None) -> list:
+        """Call OpenAI GPT-4o-mini Vision API with one or more base64 images.
+        Returns list of dicts with 'headers' and 'rows'."""
+        if not HAS_OPENAI:
+            raise ValueError("OpenAI package not installed. Run: pip install openai")
+        if not OPENAI_API_KEY:
+            raise ValueError("OpenAI API key not configured. Set OPENAI_API_KEY environment variable.")
+
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        all_data = []
+
+        for idx, b64_img in enumerate(base64_images):
+            label = (page_labels[idx] if page_labels else f"Image {idx + 1}")
+            logger.info(f"Sending {label} to OpenAI GPT-4o-mini for extraction...")
+
+            # Detect image MIME type from base64 header or default to png
+            mime = "image/png"
+            if b64_img.startswith("/9j/"):
+                mime = "image/jpeg"
+            elif b64_img.startswith("iVBOR"):
+                mime = "image/png"
 
             try:
                 response = client.chat.completions.create(
-                    model="gpt-4o",
+                    model="gpt-4o-mini",
                     messages=[
                         {
                             "role": "user",
                             "content": [
-                                {"type": "text", "text": prompt},
+                                {"type": "text", "text": self._EXTRACTION_PROMPT},
                                 {
                                     "type": "image_url",
                                     "image_url": {
-                                        "url": f"data:image/png;base64,{base64_image}",
+                                        "url": f"data:{mime};base64,{b64_img}",
                                         "detail": "high"
                                     }
                                 }
                             ]
                         }
                     ],
-                    max_tokens=4096,
+                    max_tokens=16384,
                     temperature=0
                 )
-                
+
                 result_text = response.choices[0].message.content.strip()
-                
-                # Parse JSON from response
-                # Handle markdown code blocks
-                if result_text.startswith("```"):
-                    result_text = re.sub(r'^```(?:json)?\n?', '', result_text)
-                    result_text = re.sub(r'\n?```$', '', result_text)
-                
+                logger.info(f"{label}: Got response ({len(result_text)} chars)")
+
+                # Strip markdown code fences if present
+                if "```" in result_text:
+                    result_text = re.sub(r'^```(?:json)?\s*\n?', '', result_text)
+                    result_text = re.sub(r'\n?\s*```\s*$', '', result_text)
+
                 data = json.loads(result_text)
-                
-                if 'headers' in data and 'rows' in data:
-                    if page_num == 0:
-                        all_data.append({'headers': data['headers'], 'rows': data['rows']})
-                    else:
-                        # For subsequent pages, just add rows
-                        all_data.append({'rows': data['rows']})
-                    
-                    logger.info(f"Page {page_num + 1}: Extracted {len(data['rows'])} rows")
-                
+
+                if 'headers' in data and 'rows' in data and len(data['rows']) > 0:
+                    all_data.append(data)
+                    logger.info(f"{label}: Extracted {len(data['rows'])} rows, {len(data['headers'])} columns")
+                else:
+                    logger.warning(f"{label}: No valid data in response")
+
             except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse JSON from page {page_num + 1}: {e}")
-                logger.error(f"Response was: {result_text[:500]}")
+                logger.error(f"{label}: Failed to parse JSON: {e}")
+                logger.error(f"{label}: Response preview: {result_text[:300]}")
             except Exception as e:
-                logger.error(f"OpenAI API error on page {page_num + 1}: {e}")
-        
+                logger.error(f"{label}: OpenAI API error: {e}")
+
+        return all_data
+
+    def _combine_extracted_data(self, all_data: list) -> pd.DataFrame:
+        """Combine extracted data from multiple pages/images into a single DataFrame."""
         if not all_data:
-            raise ValueError("OpenAI could not extract any data from the PDF")
-        
-        # Combine all pages into a DataFrame
-        headers = all_data[0].get('headers', [])
+            raise ValueError("No data could be extracted from the file.")
+
+        # Use headers from first page
+        headers = all_data[0]['headers']
         all_rows = []
+
         for page_data in all_data:
-            all_rows.extend(page_data.get('rows', []))
-        
-        if not headers or not all_rows:
-            raise ValueError("No valid data extracted from PDF")
-        
-        # Create DataFrame
-        df = pd.DataFrame(all_rows, columns=headers)
-        logger.info(f"Total extracted: {len(df)} rows with columns: {list(df.columns)}")
-        
+            page_headers = page_data.get('headers', headers)
+            rows = page_data.get('rows', [])
+
+            # If this page has different columns, try to align
+            if page_headers != headers:
+                # Map page columns to main headers
+                col_map = {}
+                for i, h in enumerate(page_headers):
+                    if h in headers:
+                        col_map[i] = headers.index(h)
+                    else:
+                        # Add new column
+                        headers.append(h)
+                        col_map[i] = len(headers) - 1
+
+                for row in rows:
+                    aligned_row = [''] * len(headers)
+                    for src_idx, dst_idx in col_map.items():
+                        if src_idx < len(row):
+                            aligned_row[dst_idx] = row[src_idx]
+                    all_rows.append(aligned_row)
+            else:
+                all_rows.extend(rows)
+
+        # Pad rows to match header length
+        num_cols = len(headers)
+        padded_rows = []
+        for row in all_rows:
+            if len(row) < num_cols:
+                row = row + [''] * (num_cols - len(row))
+            elif len(row) > num_cols:
+                row = row[:num_cols]
+            padded_rows.append(row)
+
+        df = pd.DataFrame(padded_rows, columns=headers)
+        logger.info(f"Combined result: {len(df)} rows, columns: {list(df.columns)}")
         return df
 
+    def _pdf_to_base64_images(self, file_path_or_buffer) -> list:
+        """Convert PDF pages to base64-encoded PNG images using PyMuPDF."""
+        if not HAS_PYMUPDF:
+            raise ValueError("PyMuPDF not installed. Run: pip install PyMuPDF")
+
+        # Read PDF bytes
+        if hasattr(file_path_or_buffer, 'read'):
+            file_path_or_buffer.seek(0)
+            pdf_bytes = file_path_or_buffer.read()
+        else:
+            with open(file_path_or_buffer, 'rb') as f:
+                pdf_bytes = f.read()
+
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        base64_images = []
+
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            # Render at 200 DPI for good quality
+            pix = page.get_pixmap(dpi=200)
+            img_bytes = pix.tobytes("png")
+            b64 = base64.b64encode(img_bytes).decode('utf-8')
+            base64_images.append(b64)
+            logger.info(f"PDF page {page_num + 1}/{len(doc)}: converted to image ({pix.width}x{pix.height})")
+
+        doc.close()
+        logger.info(f"Converted PDF to {len(base64_images)} images")
+        return base64_images
+
+    def _image_to_base64(self, file_path_or_buffer) -> str:
+        """Convert an image file to base64-encoded string."""
+        if hasattr(file_path_or_buffer, 'read'):
+            file_path_or_buffer.seek(0)
+            img_bytes = file_path_or_buffer.read()
+        else:
+            with open(file_path_or_buffer, 'rb') as f:
+                img_bytes = f.read()
+
+        return base64.b64encode(img_bytes).decode('utf-8')
+
     def _extract_pdf_tables(self, file_path_or_buffer) -> pd.DataFrame:
-        """Extract tables from PDF files - uses OpenAI Vision API for best accuracy."""
-        
-        # Try OpenAI Vision API first (best accuracy)
-        if HAS_OPENAI and OPENAI_API_KEY:
-            try:
-                logger.info("Using OpenAI Vision API for PDF extraction...")
-                return self._extract_pdf_with_openai(file_path_or_buffer)
-            except Exception as e:
-                logger.warning(f"OpenAI extraction failed: {e}, falling back to traditional methods")
-                # Reset file position for fallback methods
-                if hasattr(file_path_or_buffer, 'seek'):
-                    file_path_or_buffer.seek(0)
-        
-        all_dfs = []
-        
-        # Try pdfplumber (fallback)
-        if HAS_PDFPLUMBER:
-            try:
-                if hasattr(file_path_or_buffer, 'read'):
-                    file_path_or_buffer.seek(0)
-                    pdf_bytes = file_path_or_buffer.read()
-                    pdf = pdfplumber.open(io.BytesIO(pdf_bytes))
-                else:
-                    pdf = pdfplumber.open(file_path_or_buffer)
-                
-                for page in pdf.pages:
-                    tables = page.extract_tables()
-                    for table in tables:
-                        if table and len(table) > 1:
-                            df = pd.DataFrame(table[1:], columns=table[0])
-                            if not df.empty:
-                                all_dfs.append(df)
-                pdf.close()
-                
-                if all_dfs:
-                    return pd.concat(all_dfs, ignore_index=True)
-            except Exception:
-                pass
-        
-        # Fallback to tabula
-        if HAS_TABULA:
-            try:
-                if hasattr(file_path_or_buffer, 'read'):
-                    file_path_or_buffer.seek(0)
-                    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-                        tmp.write(file_path_or_buffer.read())
-                        tmp_path = tmp.name
-                    dfs = tabula.read_pdf(tmp_path, pages='all', multiple_tables=True)
-                    os.unlink(tmp_path)
-                else:
-                    dfs = tabula.read_pdf(file_path_or_buffer, pages='all', multiple_tables=True)
-                
-                if dfs:
-                    return pd.concat(dfs, ignore_index=True)
-            except Exception:
-                pass
-        
-        raise ValueError("Could not extract tables from PDF. Install pdfplumber or tabula-py.")
+        """Extract tables from PDF using OpenAI GPT-4o-mini Vision API via PyMuPDF."""
+        logger.info("Extracting PDF data using OpenAI GPT-4o-mini + PyMuPDF...")
+
+        # Convert PDF pages to images
+        base64_images = self._pdf_to_base64_images(file_path_or_buffer)
+        page_labels = [f"PDF Page {i+1}" for i in range(len(base64_images))]
+
+        # Send to OpenAI for extraction
+        all_data = self._call_openai_vision(base64_images, page_labels)
+
+        # Combine all pages
+        return self._combine_extracted_data(all_data)
+
+    def _extract_image_tables(self, file_path_or_buffer) -> pd.DataFrame:
+        """Extract tables from image files (JPG, JPEG, PNG, etc.) using OpenAI GPT-4o-mini."""
+        logger.info("Extracting image data using OpenAI GPT-4o-mini...")
+
+        b64 = self._image_to_base64(file_path_or_buffer)
+
+        # Send to OpenAI for extraction
+        all_data = self._call_openai_vision([b64], ["Image"])
+
+        return self._combine_extracted_data(all_data)
 
     def _parse_sap_report(self, file_path_or_buffer) -> pd.DataFrame:
         """Parse SAP-style fixed-width or delimited reports."""
@@ -376,15 +370,21 @@ Return ONLY the JSON object, no other text."""
         return pd.read_fwf(io.StringIO(content))
 
     def load_file(self, file_path_or_buffer, file_type: str = "auto") -> pd.DataFrame:
-        """Load data from Excel, CSV, PDF, or SAP report file.
+        """Load data from Excel, CSV, PDF, Image, or SAP report file.
         Auto-detects the header row for Tally-style exports that have
         company name / address metadata in the first few rows."""
 
         detected_type = self._detect_file_type(file_path_or_buffer) if file_type == "auto" else file_type
         
-        # Handle PDF files
+        # Handle PDF files via OpenAI GPT-4o-mini
         if detected_type == 'pdf':
             df = self._extract_pdf_tables(file_path_or_buffer)
+            df = self._post_process_extracted(df)
+            return df
+        
+        # Handle Image files (JPG, JPEG, PNG, etc.) via OpenAI GPT-4o-mini
+        if detected_type == 'image':
+            df = self._extract_image_tables(file_path_or_buffer)
             df = self._post_process_extracted(df)
             return df
         
