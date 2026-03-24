@@ -804,11 +804,11 @@ class DataNormalizer:
         # Look for a sign/type indicator column
         for col in df.columns:
             col_lower = str(col).lower().strip()
-            sample_vals = df[col].dropna().head(20).astype(str).str.lower().tolist()
+            sample_vals = [str(x).lower() for x in df[col].dropna().head(20).tolist()]
             
             # Check if column contains Dr/Cr or +/- indicators
-            has_dr_cr = any('dr' in v or 'cr' in v for v in sample_vals)
-            has_plus_minus = any(v.strip() in ['+', '-'] for v in sample_vals)
+            has_dr_cr = any('dr' in str(v) or 'cr' in str(v) for v in sample_vals)
+            has_plus_minus = any(str(v).strip() in ['+', '-'] for v in sample_vals)
             
             if has_dr_cr or has_plus_minus:
                 mapping['_sign_column'] = col
