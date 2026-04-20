@@ -671,8 +671,10 @@ def reconcile(x_user_id: Optional[str] = Header(None)):
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Reconciliation failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback as _tb
+        tb_str = _tb.format_exc()
+        logger.error(f"Reconciliation failed:\n{tb_str}")
+        raise HTTPException(status_code=500, detail=f"{e}\n---TRACEBACK---\n{tb_str}")
 
 
 @app.get("/api/results")
@@ -758,6 +760,29 @@ def update_config(update: ConfigUpdate):
             setattr(config, field, value)
     state["config"] = config
     return config.to_dict()
+
+
+@app.get("/api/debug-exceptions")
+def debug_exceptions():
+    """Debug: show normalized data for unmatched transactions."""
+    if state["results"] is None:
+        raise HTTPException(status_code=400, detail="No results yet.")
+    results = state["results"]
+    exceptions = results.get("exceptions", [])
+    df_a = state.get("df_a_norm")
+    df_b = state.get("df_b_norm")
+    debug = {"exceptions": exceptions}
+    if df_a is not None:
+        exc_ids_a = {e["Row_ID"] for e in exceptions if e["Company"] == "A"}
+        debug["df_a_exceptions"] = df_a[df_a["row_id"].isin(exc_ids_a)][
+            ["row_id","transaction_date","debit_amount","credit_amount","net_amount","description"]
+        ].to_dict(orient="records")
+    if df_b is not None:
+        exc_ids_b = {e["Row_ID"] for e in exceptions if e["Company"] == "B"}
+        debug["df_b_exceptions"] = df_b[df_b["row_id"].isin(exc_ids_b)][
+            ["row_id","transaction_date","debit_amount","credit_amount","net_amount","description"]
+        ].to_dict(orient="records")
+    return debug
 
 
 @app.post("/api/reset")

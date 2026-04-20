@@ -13,7 +13,7 @@ class ReconciliationConfig:
     """Central configuration for the reconciliation engine."""
 
     # --- Date Tolerance ---
-    date_tolerance_days: int = 7
+    date_tolerance_days: int = 30
 
     # --- Amount Tolerances ---
     rounding_tolerance: float = 5.0

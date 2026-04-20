@@ -599,6 +599,62 @@ class DataNormalizer:
         # Try fixed-width parsing
         return pd.read_fwf(io.StringIO(content))
 
+    # Sheet names that indicate summary/non-transaction data — heavily penalised
+    _SUMMARY_SHEET_KEYWORDS = {
+        'brs', 'summary', 'index', 'cover', 'toc', 'report', 'reconcil',
+        'consolidated', 'master', 'pivot', 'dashboard',
+    }
+
+    def _select_best_excel_sheet(self, file_path_or_buffer) -> str:
+        """Pick the Excel sheet most likely to contain transaction data.
+        Scores each sheet by (a) number of rows with a date AND a non-zero
+        number, minus a heavy penalty for known summary sheet names."""
+        try:
+            if hasattr(file_path_or_buffer, 'seek'):
+                file_path_or_buffer.seek(0)
+            xf = pd.ExcelFile(file_path_or_buffer, engine='openpyxl')
+            sheet_names = xf.sheet_names
+            if len(sheet_names) == 1:
+                return sheet_names[0]
+
+            best_sheet, best_score = sheet_names[0], -1
+            for sname in sheet_names:
+                try:
+                    # Name-based penalty: summary sheets score -1000
+                    sname_lower = str(sname).strip().lower()
+                    name_penalty = -1000 if any(
+                        kw in sname_lower for kw in self._SUMMARY_SHEET_KEYWORDS
+                    ) else 0
+
+                    df_raw = xf.parse(sname, header=None, nrows=300)
+                    score = name_penalty
+                    for _, row in df_raw.iterrows():
+                        vals = row.tolist()
+                        has_date = any(
+                            isinstance(v, pd.Timestamp) or
+                            (isinstance(v, str) and
+                             re.search(r'\d{1,4}[-/]\d{1,2}[-/]\d{1,4}', v))
+                            for v in vals
+                        )
+                        has_number = any(
+                            isinstance(v, (int, float)) and
+                            not pd.isna(v) and v != 0
+                            for v in vals
+                        )
+                        if has_date and has_number:
+                            score += 1
+                    if score > best_score:
+                        best_score = score
+                        best_sheet = sname
+                except Exception:
+                    continue
+            logger.info(f"Selected sheet '{best_sheet}' (score={best_score}) "
+                        f"from {sheet_names}")
+            return best_sheet
+        except Exception as e:
+            logger.warning(f"Sheet selection failed: {e}, using first sheet")
+            return 0
+
     def load_file(self, file_path_or_buffer, file_type: str = "auto") -> pd.DataFrame:
         """Load data from Excel, CSV, PDF, Image, or SAP report file.
         Auto-detects the header row for Tally-style exports that have
@@ -626,12 +682,20 @@ class DataNormalizer:
 
         is_excel = detected_type == 'excel'
 
+        # --- For Excel: pick the sheet with the most transaction data ---
+        sheet_name = 0  # default: first sheet
+        if is_excel:
+            sheet_name = self._select_best_excel_sheet(file_path_or_buffer)
+            if hasattr(file_path_or_buffer, 'seek'):
+                file_path_or_buffer.seek(0)
+
         # --- First pass: read WITHOUT headers to find the real header row ---
         if hasattr(file_path_or_buffer, 'seek'):
             file_path_or_buffer.seek(0)
 
         if is_excel:
-            raw = self._read_excel_any(file_path_or_buffer, header=None)
+            raw = self._read_excel_any(file_path_or_buffer, header=None,
+                                       sheet_name=sheet_name)
         else:
             raw = pd.read_csv(file_path_or_buffer, header=None)
 
@@ -642,7 +706,8 @@ class DataNormalizer:
             file_path_or_buffer.seek(0)
 
         if is_excel:
-            df = self._read_excel_any(file_path_or_buffer, header=header_row)
+            df = self._read_excel_any(file_path_or_buffer, header=header_row,
+                                      sheet_name=sheet_name)
         else:
             df = pd.read_csv(file_path_or_buffer, header=header_row)
 
@@ -753,10 +818,10 @@ class DataNormalizer:
         patterns = [
             ('debit',        [r'debit.*amount', r'debit.*amt', r'\bdebit\b',
                               r'\bdr\b.*amt', r'\bdr\b', r'\+\s*amount', r'money.*in',
-                              r'receipt', r'inflow', r'received', r'deposit']),
+                              r'receipt', r'inflow', r'received', r'withdrawal']),
             ('credit',       [r'credit.*amount', r'credit.*amt', r'\bcredit\b',
                               r'\bcr\b.*amt', r'\bcr\b', r'\-\s*amount', r'money.*out',
-                              r'payment', r'outflow', r'paid', r'withdrawal']),
+                              r'payment', r'outflow', r'paid', r'deposit']),
             ('date',         [r'trans.*date', r'txn.*date', r'posting.*date',
                               r'value.*date', r'vch.*date', r'\bdate\b', r'entry.*date']),
             ('voucher',      [r'voucher.*no', r'vch.*no', r'\bvoucher\b',
