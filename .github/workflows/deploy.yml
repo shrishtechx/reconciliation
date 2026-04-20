@@ -20,10 +20,10 @@ jobs:
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
-          username: ubuntu
+          username: ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            cd /home/ubuntu/reconciliation
+            cd /home/ec2-user/reconciliation
             git pull origin main
             cd backend
             source venv/bin/activate
