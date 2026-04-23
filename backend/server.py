@@ -570,7 +570,7 @@ def load_sample():
 @app.post("/api/reconcile")
 def reconcile(x_user_id: Optional[str] = Header(None)):
     """Run the reconciliation engine on uploaded data."""
-    if state["df_a_raw"] is None or state["df_b_raw"] is None:
+    if state["df_a_raw"] is None and state["df_b_raw"] is None:
         raise HTTPException(status_code=400, detail="No data uploaded. Upload files first.")
 
     # Get user ID for credit tracking
@@ -609,22 +609,64 @@ def reconcile(x_user_id: Optional[str] = Header(None)):
         engine = ReconciliationEngine(config)
 
         t0 = time.time()
-        df_a = norm.normalize(state["df_a_raw"], company_label="A")
-        df_b = norm.normalize(state["df_b_raw"], company_label="B")
+        _empty = pd.DataFrame()
+        df_a = norm.normalize(state["df_a_raw"], company_label="A") if state["df_a_raw"] is not None else _empty
+        df_b = norm.normalize(state["df_b_raw"], company_label="B") if state["df_b_raw"] is not None else _empty
+
+        # Auto-split side-by-side comparison files when one side produces 0 rows
+        if len(df_a) == 0 and state["df_b_raw"] is not None and norm.is_comparison_file(state["df_b_raw"]):
+            logger.info("Detected comparison file in B — auto-splitting into A (right) and B (left)")
+            raw_left, raw_right = norm.split_comparison_file(state["df_b_raw"])
+            df_a = norm.normalize(raw_right, company_label="A")  # RIGHT = books side
+            df_b = norm.normalize(raw_left,  company_label="B")  # LEFT  = bank side
+        elif len(df_b) == 0 and state["df_a_raw"] is not None and norm.is_comparison_file(state["df_a_raw"]):
+            logger.info("Detected comparison file in A — auto-splitting: RIGHT=books(A), LEFT=bank(B)")
+            raw_left, raw_right = norm.split_comparison_file(state["df_a_raw"])
+            df_a = norm.normalize(raw_right, company_label="A")  # RIGHT = BLR books
+            df_b = norm.normalize(raw_left,  company_label="B")  # LEFT  = CBE bank
+        elif len(df_a) == 0 and state["df_a_raw"] is not None and norm.is_comparison_file(state["df_a_raw"]):
+            logger.info("Detected comparison file in A (both 0) — auto-splitting")
+            raw_left, raw_right = norm.split_comparison_file(state["df_a_raw"])
+            df_a = norm.normalize(raw_left,  company_label="A")
+            df_b = norm.normalize(raw_right, company_label="B")
 
         if len(df_a) == 0 or len(df_b) == 0:
-            # Log raw data info for debugging
             raw_a_cols = list(state["df_a_raw"].columns) if state["df_a_raw"] is not None else []
             raw_b_cols = list(state["df_b_raw"].columns) if state["df_b_raw"] is not None else []
             raw_a_rows = len(state["df_a_raw"]) if state["df_a_raw"] is not None else 0
             raw_b_rows = len(state["df_b_raw"]) if state["df_b_raw"] is not None else 0
             logger.error(f"Normalization failed: A raw={raw_a_rows} rows, cols={raw_a_cols[:5]}")
             logger.error(f"Normalization failed: B raw={raw_b_rows} rows, cols={raw_b_cols[:5]}")
+
+            # Detect reconciliation report files by signature columns
+            _REPORT_COLS = {'match type', 'confidence score', 'transaction id a',
+                            'transaction id b', 'amount difference', 'match_type',
+                            'confidence_score'}
+            def _is_report(cols):
+                lower = {str(c).strip().lower() for c in cols}
+                return len(lower & _REPORT_COLS) >= 2
+
+            failed_label = "Company A" if len(df_a) == 0 else "Company B"
+            failed_cols  = raw_a_cols if len(df_a) == 0 else raw_b_cols
+
+            if _is_report(raw_a_cols) or _is_report(raw_b_cols):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"'{state.get('file_a_name' if len(df_a)==0 else 'file_b_name', 'uploaded file')}' "
+                        f"appears to be a reconciliation report (output), not a ledger file. "
+                        f"Please upload the original bank statement or books ledger files "
+                        f"(Excel/CSV with Date, Debit, Credit columns)."
+                    ),
+                )
             raise HTTPException(
                 status_code=400,
-                detail=f"Normalization produced 0 rows (A={len(df_a)}, B={len(df_b)}). "
-                       f"Raw data: A={raw_a_rows} rows, B={raw_b_rows} rows. "
-                       f"A columns: {raw_a_cols[:5]}. Check file format.",
+                detail=(
+                    f"Normalization produced 0 rows for {failed_label}. "
+                    f"Raw data: {raw_a_rows} rows (A), {raw_b_rows} rows (B). "
+                    f"Could not detect Date/Debit/Credit columns in: {failed_cols[:8]}. "
+                    f"Ensure the file has columns for Date, Debit Amount, and Credit Amount."
+                ),
             )
 
         state["df_a_norm"] = df_a

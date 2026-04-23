@@ -23,7 +23,7 @@ class ReconciliationConfig:
     # Includes effective TDS+GST combined rates (e.g. 10% TDS on base with 18% GST → 8.47%)
     tax_rates: List[float] = field(default_factory=lambda: [
         1.0, 2.0, 5.0, 7.5, 8.0, 8.5, 10.0, 15.0, 18.0, 20.0])
-    tax_tolerance_pct: float = 1.0  # allowed deviation from exact tax rate
+    tax_tolerance_pct: float = 0.2  # allowed deviation from exact tax rate
 
     # --- Forex ---
     forex_tolerance_pct: float = 5.0

@@ -116,6 +116,11 @@ class ReconciliationEngine:
         self._detect_duplicates(df_a, "A")
         self._detect_duplicates(df_b, "B")
 
+        # Layer 0: Intra-company reversal — same-company, same-date, opposite-amount pairs
+        # These cancel to zero net and should not appear as exceptions
+        self._layer0_intra_reversal(df_a, "A")
+        self._layer0_intra_reversal(df_b, "B")
+
         # Layer 1: Exact match (amount + date, reference as tiebreaker)
         self._layer1_exact(df_a, df_b, idx_b)
 
@@ -131,11 +136,12 @@ class ReconciliationEngine:
         # Layer 5: Weighted-score tolerance match
         self._layer5_weighted(df_a, df_b, idx_b)
 
+        # Layer 7: Amount-only match (no date restriction — catches large timing gaps)
+        # Run BEFORE Layer 6 so exact individual matches are not stolen by group matches
+        self._layer7_amount_only(df_a, df_b, idx_b)
+
         # Layer 6: Partial settlement (one-to-many, many-to-one)
         self._layer6_partial(df_a, df_b)
-
-        # Layer 7: Amount-only match (no date restriction — catches large timing gaps)
-        self._layer7_amount_only(df_a, df_b, idx_b)
 
         # Classify remaining unmatched as exceptions
         self._classify_exceptions(df_a, df_b)
@@ -284,6 +290,45 @@ class ReconciliationEngine:
             self._mark([ra['row_id']], [rb['row_id']])
 
     # ──────────────────────────────────────────────────────────
+    # LAYER 0 — INTRA-COMPANY REVERSAL CANCELLATION
+    #   Finds same-company pairs with opposite signs on the same
+    #   date (within 1 day).  These are internal journal reversals
+    #   that net to zero and should not appear as exceptions.
+    # ──────────────────────────────────────────────────────────
+    def _layer0_intra_reversal(self, df, label: str):
+        avail = self._avail_a if label == "A" else self._avail_b
+        mark_set = self.matched_a if label == "A" else self.matched_b
+        records = [(idx, row) for idx, row in df.iterrows() if avail(row['row_id'])]
+        tol_amt = 0.01
+        for i, (idx_i, ri) in enumerate(records):
+            if not avail(ri['row_id']):
+                continue
+            net_i = round(ri['net_amount'], 2)
+            if net_i == 0:
+                continue
+            for j in range(i + 1, len(records)):
+                idx_j, rj = records[j]
+                if not avail(rj['row_id']):
+                    continue
+                net_j = round(rj['net_amount'], 2)
+                if abs(net_i + net_j) > tol_amt:
+                    continue
+                dd = self._date_diff(ri, rj)
+                if dd is not None and abs(dd) > 1:
+                    continue
+                # Opposing amounts on same/adjacent date — cancel each other
+                mark_set.add(ri['row_id'])
+                mark_set.add(rj['row_id'])
+                self.matches.append(MatchResult(
+                    [ri['row_id']], [rj['row_id']],
+                    "Internal Reversal", 100.0, 0.0, dd,
+                    "Layer 0 - Intra Reversal",
+                    f"Same-{label} opposite pair: {net_i} / {net_j}",
+                    [self._row_data(ri)], [self._row_data(rj)],
+                ))
+                break
+
+    # ──────────────────────────────────────────────────────────
     # LAYER 2 — DATE TOLERANCE MATCH
     #   Exact opposing amount + date within tolerance.
     #   If date differs, classified as "Timing Difference".
@@ -403,7 +448,7 @@ class ReconciliationEngine:
                 if abs_b == 0:
                     continue
                 dd = self._date_diff(ra, rb)
-                if dd is not None and abs(dd) > cfg.date_tolerance_days * 2:
+                if dd is not None and abs(dd) > cfg.date_tolerance_days:
                     continue
 
                 # Forex check (clear signal: currency ≠ INR)
@@ -516,7 +561,7 @@ class ReconciliationEngine:
                 if not avail_m(rm['row_id']):
                     continue
                 dd = self._date_diff(rs, rm)
-                if dd is not None and abs(dd) > cfg.date_tolerance_days * 4:
+                if dd is not None and abs(dd) > cfg.date_tolerance_days * 12:
                     continue
                 if rm['abs_amount'] > target + cfg.partial_settlement_tolerance:
                     continue

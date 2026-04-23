@@ -603,6 +603,7 @@ class DataNormalizer:
     _SUMMARY_SHEET_KEYWORDS = {
         'brs', 'summary', 'index', 'cover', 'toc', 'report', 'reconcil',
         'consolidated', 'master', 'pivot', 'dashboard',
+        'matched', 'exception', 'unmatched', 'duplicate',
     }
 
     def _select_best_excel_sheet(self, file_path_or_buffer) -> str:
@@ -613,47 +614,110 @@ class DataNormalizer:
             if hasattr(file_path_or_buffer, 'seek'):
                 file_path_or_buffer.seek(0)
             xf = pd.ExcelFile(file_path_or_buffer, engine='openpyxl')
-            sheet_names = xf.sheet_names
-            if len(sheet_names) == 1:
-                return sheet_names[0]
+            try:
+                sheet_names = xf.sheet_names
+                if len(sheet_names) == 1:
+                    return sheet_names[0]
 
-            best_sheet, best_score = sheet_names[0], -1
-            for sname in sheet_names:
-                try:
-                    # Name-based penalty: summary sheets score -1000
-                    sname_lower = str(sname).strip().lower()
-                    name_penalty = -1000 if any(
-                        kw in sname_lower for kw in self._SUMMARY_SHEET_KEYWORDS
-                    ) else 0
+                best_sheet, best_score = sheet_names[0], -1
+                for sname in sheet_names:
+                    try:
+                        # Name-based penalty: summary sheets score -1000
+                        sname_lower = str(sname).strip().lower()
+                        name_penalty = -1000 if any(
+                            kw in sname_lower for kw in self._SUMMARY_SHEET_KEYWORDS
+                        ) else 0
 
-                    df_raw = xf.parse(sname, header=None, nrows=300)
-                    score = name_penalty
-                    for _, row in df_raw.iterrows():
-                        vals = row.tolist()
-                        has_date = any(
-                            isinstance(v, pd.Timestamp) or
-                            (isinstance(v, str) and
-                             re.search(r'\d{1,4}[-/]\d{1,2}[-/]\d{1,4}', v))
-                            for v in vals
-                        )
-                        has_number = any(
-                            isinstance(v, (int, float)) and
-                            not pd.isna(v) and v != 0
-                            for v in vals
-                        )
-                        if has_date and has_number:
-                            score += 1
-                    if score > best_score:
-                        best_score = score
-                        best_sheet = sname
-                except Exception:
-                    continue
+                        df_raw = xf.parse(sname, header=None, nrows=300)
+                        score = name_penalty
+                        for _, row in df_raw.iterrows():
+                            vals = row.tolist()
+                            has_date = any(
+                                isinstance(v, pd.Timestamp) or
+                                (isinstance(v, str) and
+                                 re.search(r'\d{1,4}[-/]\d{1,2}[-/]\d{1,4}', v))
+                                for v in vals
+                            )
+                            has_number = any(
+                                isinstance(v, (int, float)) and
+                                not pd.isna(v) and v != 0
+                                for v in vals
+                            )
+                            if has_date and has_number:
+                                score += 1
+                        if score > best_score:
+                            best_score = score
+                            best_sheet = sname
+                    except Exception:
+                        continue
+            finally:
+                xf.close()
             logger.info(f"Selected sheet '{best_sheet}' (score={best_score}) "
                         f"from {sheet_names}")
             return best_sheet
         except Exception as e:
             logger.warning(f"Sheet selection failed: {e}, using first sheet")
             return 0
+
+    def is_comparison_file(self, df: pd.DataFrame) -> bool:
+        """Return True if df looks like a Tally side-by-side comparison export.
+        Signature: has columns ending with '.1' that include a date AND a debit/credit."""
+        dot1 = [str(c).strip().lower() for c in df.columns if str(c).strip().endswith('.1')]
+        if not dot1:
+            return False
+        has_date   = any('date' in c for c in dot1)
+        has_amount = any('debit' in c or 'credit' in c or 'amount' in c for c in dot1)
+        return has_date and has_amount
+
+    def split_comparison_file(self, df: pd.DataFrame):
+        """Split a side-by-side comparison file into (df_left, df_right).
+
+        Strategy 1 (preferred): find the blank separator column (all-NaN unnamed)
+        and split positionally — everything before it is LEFT, after is RIGHT.
+
+        Strategy 2 (fallback): use '.1' suffix columns as the right-side anchor
+        and infer the separator position from the first '.1' column.
+
+        Both DataFrames have all-NaN rows dropped and '.1' suffixes removed.
+        """
+        cols = list(df.columns)
+
+        # Find the first .1-suffix column — everything to its right is the second company
+        first_dot1 = next((i for i, c in enumerate(cols)
+                           if str(c).strip().endswith('.1')), len(cols))
+
+        # The column immediately before the first .1 column is usually the blank separator
+        if first_dot1 > 0 and 'unnamed' in str(cols[first_dot1 - 1]).lower():
+            sep_idx = first_dot1 - 1
+        else:
+            sep_idx = first_dot1  # No separator column — split right at .1
+
+        left_cols  = cols[:sep_idx]
+        right_cols = cols[sep_idx + 1:] if sep_idx < first_dot1 else cols[first_dot1:]
+
+        df_left  = df[left_cols].dropna(how='all').reset_index(drop=True)
+        df_right = df[right_cols].copy()
+
+        # Remove '.1' suffixes from right-side column names
+        df_right.columns = [
+            str(c)[:-2] if str(c).strip().endswith('.1') else str(c)
+            for c in df_right.columns
+        ]
+        df_right = df_right.dropna(how='all').reset_index(drop=True)
+
+        # Rename the first unnamed text column in LEFT to 'Particulars' so the
+        # normalizer can detect it as description (enables Opening Balance filtering)
+        left_renamed = {}
+        for c in df_left.columns:
+            if 'unnamed' in str(c).lower():
+                sample = df_left[c].dropna()
+                if len(sample) > 0 and sample.dtype == object:
+                    left_renamed[c] = 'Particulars'
+                    break
+        if left_renamed:
+            df_left = df_left.rename(columns=left_renamed)
+
+        return df_left, df_right
 
     def load_file(self, file_path_or_buffer, file_type: str = "auto") -> pd.DataFrame:
         """Load data from Excel, CSV, PDF, Image, or SAP report file.
@@ -995,6 +1059,27 @@ class DataNormalizer:
         skip_mask = desc_lower.apply(
             lambda x: any(s in x for s in self._SKIP_DESCRIPTIONS))
         df = df[~skip_mask]
+
+        # 3b. Catch Opening/Closing Balance rows whose description is blank
+        #     (happens when the Excel cell is merged/empty — text-based filter above misses these).
+        #     Heuristic: blank description + blank vch type + single-sided amount at boundary date.
+        if not df.empty and 'transaction_date' in df.columns:
+            desc_lower2 = df['description'].astype(str).str.lower().str.strip()
+            blank_desc = desc_lower2.isin(['', 'nan'])
+            doc_col = df['document_type'].astype(str).str.lower().str.strip() \
+                if 'document_type' in df.columns else pd.Series([''] * len(df), index=df.index)
+            blank_doc = doc_col.isin(['', 'nan'])
+            valid_dates = df['transaction_date'].dropna()
+            if not valid_dates.empty:
+                min_date = valid_dates.min()
+                max_date = valid_dates.max()
+                ob_mask = (blank_desc & blank_doc &
+                           (df['transaction_date'] == min_date) &
+                           (df['debit_amount'] == 0) & (df['credit_amount'] > 0))
+                cb_mask = (blank_desc & blank_doc &
+                           (df['transaction_date'] == max_date) &
+                           (df['credit_amount'] == 0) & (df['debit_amount'] > 0))
+                df = df[~(ob_mask | cb_mask)]
 
         # 4. Drop rows with zero amounts AND empty description
         if not df.empty:
